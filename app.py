@@ -1,73 +1,74 @@
 import os
+import shutil
 import sqlite3
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-DB_PATH = os.getenv("DB_PATH", os.path.join("data", "ventas.db"))
+# Ruta de la DB (Render la leerá de /var/data)
+DB_PATH = os.getenv("DB_PATH", "/var/data/ventas.db")
+REPO_DB = os.path.join("data", "ventas.db")
 
 app = Flask(__name__)
 CORS(app)
 
+# Garantiza que la DB exista
+def ensure_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    if not os.path.exists(DB_PATH):
+        if os.path.exists(REPO_DB):
+            shutil.copyfile(REPO_DB, DB_PATH)
+        else:
+            raise FileNotFoundError(f"No existe {DB_PATH} ni {REPO_DB}")
+
 def get_conn():
-    # Abrir en modo solo lectura (más seguro para Render)
+    ensure_db()
     uri = f"file:{DB_PATH}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+    return sqlite3.connect(uri, uri=True, check_same_thread=False)
 
 def rows_to_dicts(cur, rows):
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, r)) for r in rows]
 
+# ===========================
+# ENDPOINTS
+# ===========================
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------------------------------
-# Endpoint dinámico SIN FILTROS
-# -------------------------------
-# Tabla: ventas
-# Dimensiones permitidas (para GROUP BY):
+@app.get("/health/db")
+def health_db():
+    try:
+        with get_conn() as conn:
+            conn.execute("SELECT 1;")
+        return {"status": "ok", "db_path": DB_PATH}
+    except Exception as e:
+        return jsonify({"status": "error", "db_path": DB_PATH, "detail": str(e)}), 503
+
+# ===========================
+# REPORT DINÁMICO SIN FILTROS
+# ===========================
+
 ALLOWED_FIELDS = [
     "bodega", "codigo", "vendedor", "nit", "sucursal",
     "sector", "subsector", "referencia", "descripcion",
     "dpto", "desc_dpto", "tipo"
 ]
 
-# Métricas (SUM):
-ALLOWED_METRICS = {
-    "venta": "SUM(venta) AS venta",
-    "cant":  "SUM(cant)  AS cant"
-}
-
-# Claves válidas para ORDER BY (campos o alias de métricas)
-ALLOWED_SORT_KEYS = set(ALLOWED_FIELDS + list(ALLOWED_METRICS.keys()))
+ALLOWED_METRICS = ["venta", "cant"]
 
 @app.post("/api/v1/report")
 def report():
-    """
-    Body esperado (sin filtros por ahora):
-    {
-      "fields":  ["bodega", "vendedor"],
-      "metrics": ["venta", "cant"],
-      "sort":    [["venta", "desc"], ["bodega", "asc"]],
-      "limit":   200,
-      "offset":  0
-    }
-    """
     try:
         payload = request.get_json(force=True, silent=False) or {}
         fields = payload.get("fields", [])
-        metrics = payload.get("metrics", ["venta"])  # por defecto sumar venta
+        metrics = payload.get("metrics", ["venta"])
         sort = payload.get("sort", [])
         limit = int(payload.get("limit", 500))
         offset = int(payload.get("offset", 0))
 
         # Validaciones
-        if not isinstance(fields, list) or not all(isinstance(x, str) for x in fields):
-            return jsonify({"status": "error", "error": "'fields' debe ser lista de strings"}), 400
-        if not isinstance(metrics, list) or not all(isinstance(x, str) for x in metrics):
-            return jsonify({"status": "error", "error": "'metrics' debe ser lista de strings"}), 400
-
-        # Validar campos y métricas contra allowlist
         for f in fields:
             if f not in ALLOWED_FIELDS:
                 return jsonify({"status": "error", "error": f"Campo no permitido: {f}"}), 400
@@ -75,78 +76,63 @@ def report():
             if m not in ALLOWED_METRICS:
                 return jsonify({"status": "error", "error": f"Métrica no permitida: {m}"}), 400
 
-        # SELECT: fields + agregaciones
-        select_parts = []
-        if fields:
-            select_parts.extend(fields)
-        # agregar métricas como expresiones SUM(...)
+        # SELECT
+        select_parts = fields.copy()
         for m in metrics:
-            select_parts.append(ALLOWED_METRICS[m])
+            select_parts.append(f"SUM({m}) AS {m}")
+        select_sql = ", ".join(select_parts)
 
-        select_sql = ", ".join(select_parts) if select_parts else ", ".join(ALLOWED_METRICS[m] for m in metrics)
+        # GROUP BY
+        group_sql = f" GROUP BY {', '.join(fields)}" if fields else ""
 
-        # FROM
-        base_sql = f"SELECT {select_sql} FROM ventas"
-
-        # GROUP BY (solo si hay fields)
-        group_by_sql = f" GROUP BY {', '.join(fields)}" if fields else ""
-
-        # ORDER BY (opcional)
+        # ORDER BY
         order_sql = ""
         if sort:
-            order_elems = []
+            order_parts = []
             for item in sort:
-                if (not isinstance(item, (list, tuple))) or len(item) != 2:
-                    return jsonify({"status": "error", "error": "Cada elemento de 'sort' debe ser [clave, 'asc'|'desc']"}), 400
-                key, direction = item[0], str(item[1]).lower()
-                if key not in ALLOWED_SORT_KEYS:
-                    return jsonify({"status": "error", "error": f"Orden no permitido por: {key}"}), 400
-                if direction not in ("asc", "desc"):
-                    return jsonify({"status": "error", "error": "Dirección de orden inválida (use 'asc' o 'desc')"}), 400
-                # Para métricas, ordenamos por su alias (venta/cant)
-                order_elems.append(f"{key} {direction.upper()}")
-            if order_elems:
-                order_sql = " ORDER BY " + ", ".join(order_elems)
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    key, direction = item
+                    if key not in (ALLOWED_FIELDS + ALLOWED_METRICS):
+                        return jsonify({"status": "error", "error": f"Orden no permitido por: {key}"}), 400
+                    order_parts.append(f"{key} {direction.upper()}")
+                else:
+                    return jsonify({"status":"error","error":"Cada elemento de 'sort' debe ser [campo,'asc'|'desc']"}),400
+            order_sql = " ORDER BY " + ", ".join(order_parts)
 
-        # LIMIT/OFFSET (parametrizados)
-        limit = max(0, min(limit, 5000))  # hard cap
-        offset = max(0, offset)
-
-        final_sql = f"{base_sql}{group_by_sql}{order_sql} LIMIT ? OFFSET ?;"
+        # SQL Final
+        sql = f"""
+            SELECT {select_sql}
+            FROM ventas
+            {group_sql}
+            {order_sql}
+            LIMIT ? OFFSET ?;
+        """
 
         with get_conn() as conn:
             cur = conn.cursor()
-            cur.execute(final_sql, (limit, offset))
+            cur.execute(sql, (limit, offset))
             rows = cur.fetchall()
             items = rows_to_dicts(cur, rows)
 
         return jsonify({
             "status": "ok",
-            "count": len(items),
             "fields": fields,
             "metrics": metrics,
+            "count": len(items),
             "rows": items,
             "limit": limit,
             "offset": offset
-        }), 200
+        })
 
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return jsonify({"status":"error","detail":str(e)}), 500
 
-# -------------------------------
-# Tus endpoints existentes
-# -------------------------------
+# ===========================
+# ENDPOINTS EXISTENTES
+# ===========================
+
 @app.get("/ventas")
 def ventas_list():
-    """
-    Filtros opcionales:
-      - cliente (substring)
-      - referencia (substring)
-      - fecha_desde (YYYY-MM-DD)
-      - fecha_hasta (YYYY-MM-DD)
-      - limit (por defecto 100)
-      - offset (por defecto 0)
-    """
     cliente = request.args.get("cliente")
     referencia = request.args.get("referencia")
     fecha_desde = request.args.get("fecha_desde")
@@ -174,26 +160,21 @@ def ventas_list():
         params.append(fecha_hasta)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    sql = f"""
-        SELECT *
-        FROM ventas
-        {where_sql}
-        LIMIT ? OFFSET ?;
-    """
+    sql = f"SELECT * FROM ventas {where_sql} LIMIT ? OFFSET ?;"
     params += [limit, offset]
 
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = cur.fetchall()
+        items = rows_to_dicts(cur, rows)
 
-        # total para paginación
         cur2 = conn.cursor()
         cur2.execute(f"SELECT COUNT(*) FROM ventas {where_sql}", params[:-2])
         total = cur2.fetchone()[0]
 
     return jsonify({
-        "items": rows_to_dicts(cur, rows),
+        "items": items,
         "limit": limit,
         "offset": offset,
         "total": total
@@ -209,5 +190,8 @@ def ventas_by_id(rowid: int):
             return jsonify({"error": "no encontrado"}), 404
         return jsonify(rows_to_dicts(cur, [row])[0])
 
+# ===========================
+# RUN LOCAL
+# ===========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
