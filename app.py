@@ -1,197 +1,159 @@
+# app.py
 import os
-import shutil
-import sqlite3
-from flask import Flask, request, jsonify
+import re
+import time
+from typing import Any, Dict, List, Tuple
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
-# Ruta de la DB (Render la leerá de /var/data)
-DB_PATH = os.getenv("DB_PATH", "/var/data/ventas.db")
-REPO_DB = os.path.join("data", "ventas.db")
+# ==============================
+# Configuración por variables de entorno
+# ==============================
+# Ejemplos:
+# DATABASE_URL=postgresql+psycopg2://user:pass@host:5432/dbname
+# API_KEY=clave_opcional
+# MAX_LIMIT=5000
+# DEFAULT_LIMIT=500
+# MAX_TIMEOUT_MS=15000
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+API_KEY = os.getenv("API_KEY")  # si se define, se exige en header X-API-Key
+MAX_LIMIT = int(os.getenv("MAX_LIMIT", "5000"))
+DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "500"))
+MAX_TIMEOUT_MS = int(os.getenv("MAX_TIMEOUT_MS", "15000"))
 
+# Bloqueo básico contra inyección / DDL/DML
+FORBIDDEN_PATTERNS = [
+    r";",  # múltiples sentencias
+    r"\b(insert|update|delete|merge|call|grant|revoke|truncate|alter|drop|create)\b",
+    r"\bcopy\b",  # COPY de PostgreSQL
+    r"--",        # comentarios inline
+    r"/\*",       # comentarios multi
+]
+SELECT_PREFIX = re.compile(r"^\s*select\b", re.IGNORECASE)
+
+# ==============================
+# App & DB
+# ==============================
 app = Flask(__name__)
 CORS(app)
 
-# Garantiza que la DB exista
-def ensure_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    if not os.path.exists(DB_PATH):
-        if os.path.exists(REPO_DB):
-            shutil.copyfile(REPO_DB, DB_PATH)
-        else:
-            raise FileNotFoundError(f"No existe {DB_PATH} ni {REPO_DB}")
+# pool_pre_ping evita conexiones muertas, pool_recycle renueva conexiones largas
+engine: Engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=180,
+    future=True
+)
 
-def get_conn():
-    ensure_db()
-    uri = f"file:{DB_PATH}?mode=ro"
-    return sqlite3.connect(uri, uri=True, check_same_thread=False)
+# ==============================
+# Helpers
+# ==============================
+def _check_api_key() -> bool:
+    """Valida API key si está configurada."""
+    if API_KEY:
+        return request.headers.get("X-API-Key") == API_KEY
+    return True
 
-def rows_to_dicts(cur, rows):
-    cols = [c[0] for c in cur.description]
-    return [dict(zip(cols, r)) for r in rows]
+def _validate_sql(sql: str) -> Tuple[bool, str]:
+    """Solo acepta SELECT y rechaza patrones peligrosos."""
+    if not SELECT_PREFIX.search(sql or ""):
+        return False, "Solo se permiten consultas que inicien con SELECT."
+    lower_sql = sql.lower()
+    for pat in FORBIDDEN_PATTERNS:
+        if re.search(pat, lower_sql):
+            return False, f"Patrón prohibido detectado: {pat}"
+    return True, ""
 
-# ===========================
-# ENDPOINTS
-# ===========================
+def _apply_limit_offset(sql: str, limit: int, offset: int) -> str:
+    """Si el SQL no trae LIMIT/OFFSET, se los agrega al final."""
+    if re.search(r"\blimit\b\s+\d+", sql, re.IGNORECASE):
+        return sql
+    return f"{sql.strip()} LIMIT :__limit OFFSET :__offset"
 
+def _set_statement_timeout(conn, timeout_ms: int):
+    """Configura timeout por consulta según motor."""
+    if DATABASE_URL.startswith("postgresql"):
+        conn.exec_driver_sql(f"SET LOCAL statement_timeout = {timeout_ms}")
+        conn.exec_driver_sql("SET LOCAL default_transaction_read_only = on")
+    elif DATABASE_URL.startswith("sqlite"):
+        conn.exec_driver_sql(f"PRAGMA busy_timeout = {timeout_ms}")
+
+# ==============================
+# Endpoints
+# ==============================
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"}), 200
 
-@app.get("/health/db")
-def health_db():
+@app.post("/run_query")
+def run_query():
+    # Autenticación opcional
+    if not _check_api_key():
+        return jsonify({"error": "Unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    sql = payload.get("sql", "")
+    params: Dict[str, Any] = payload.get("params", {}) or {}
+
+    # Validaciones
+    ok, msg = _validate_sql(sql)
+    if not ok:
+        return jsonify({"error": msg}), 400
+
     try:
-        with get_conn() as conn:
-            conn.execute("SELECT 1;")
-        return {"status": "ok", "db_path": DB_PATH}
-    except Exception as e:
-        return jsonify({"status": "error", "db_path": DB_PATH, "detail": str(e)}), 503
+        req_limit = int(payload.get("limit", DEFAULT_LIMIT))
+        req_offset = int(payload.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit/offset deben ser enteros"}), 400
 
-# ===========================
-# REPORT DINÁMICO SIN FILTROS
-# ===========================
+    if req_limit < 1:
+        req_limit = DEFAULT_LIMIT
+    limit_effective = min(req_limit, MAX_LIMIT)
 
-ALLOWED_FIELDS = [
-    "bodega", "codigo", "vendedor", "nit", "sucursal",
-    "sector", "subsector", "referencia", "descripcion",
-    "dpto", "desc_dpto", "tipo"
-]
-
-ALLOWED_METRICS = ["venta", "cant"]
-
-@app.post("/api/v1/report")
-def report():
     try:
-        payload = request.get_json(force=True, silent=False) or {}
-        fields = payload.get("fields", [])
-        metrics = payload.get("metrics", ["venta"])
-        sort = payload.get("sort", [])
-        limit = int(payload.get("limit", 500))
-        offset = int(payload.get("offset", 0))
+        timeout_ms_req = int(payload.get("timeout_ms", MAX_TIMEOUT_MS))
+    except ValueError:
+        timeout_ms_req = MAX_TIMEOUT_MS
+    timeout_ms = min(timeout_ms_req, MAX_TIMEOUT_MS)
 
-        # Validaciones
-        for f in fields:
-            if f not in ALLOWED_FIELDS:
-                return jsonify({"status": "error", "error": f"Campo no permitido: {f}"}), 400
-        for m in metrics:
-            if m not in ALLOWED_METRICS:
-                return jsonify({"status": "error", "error": f"Métrica no permitida: {m}"}), 400
+    # Agregar paginación si falta
+    sql_final = _apply_limit_offset(sql, limit_effective, req_offset)
 
-        # SELECT
-        select_parts = fields.copy()
-        for m in metrics:
-            select_parts.append(f"SUM({m}) AS {m}")
-        select_sql = ", ".join(select_parts)
+    # Params reservados para LIMIT/OFFSET si fueron inyectados por el server
+    bound_params = dict(params)
+    if ":__limit" in sql_final or " :__limit" in sql_final:
+        bound_params["__limit"] = limit_effective
+        bound_params["__offset"] = req_offset
 
-        # GROUP BY
-        group_sql = f" GROUP BY {', '.join(fields)}" if fields else ""
-
-        # ORDER BY
-        order_sql = ""
-        if sort:
-            order_parts = []
-            for item in sort:
-                if isinstance(item, (list, tuple)) and len(item) == 2:
-                    key, direction = item
-                    if key not in (ALLOWED_FIELDS + ALLOWED_METRICS):
-                        return jsonify({"status": "error", "error": f"Orden no permitido por: {key}"}), 400
-                    order_parts.append(f"{key} {direction.upper()}")
-                else:
-                    return jsonify({"status":"error","error":"Cada elemento de 'sort' debe ser [campo,'asc'|'desc']"}),400
-            order_sql = " ORDER BY " + ", ".join(order_parts)
-
-        # SQL Final
-        sql = f"""
-            SELECT {select_sql}
-            FROM ventas
-            {group_sql}
-            {order_sql}
-            LIMIT ? OFFSET ?;
-        """
-
-        with get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(sql, (limit, offset))
-            rows = cur.fetchall()
-            items = rows_to_dicts(cur, rows)
+    start = time.time()
+    try:
+        with engine.begin() as conn:
+            _set_statement_timeout(conn, timeout_ms)
+            res = conn.execute(text(sql_final), bound_params)
+            rows = res.fetchall()
+            fields = list(res.keys())
+            elapsed_ms = round((time.time() - start) * 1000, 3)
 
         return jsonify({
-            "status": "ok",
             "fields": fields,
-            "metrics": metrics,
-            "count": len(items),
-            "rows": items,
-            "limit": limit,
-            "offset": offset
-        })
+            "rows": [list(r) for r in rows],
+            "rowcount": len(rows),
+            "limit_applied": limit_effective,
+            "offset": req_offset,
+            "elapsed_ms": elapsed_ms
+        }), 200
 
+    except SQLAlchemyError as e:
+        return jsonify({"error": "DB_ERROR", "detail": str(e.__cause__ or e)}), 500
     except Exception as e:
-        return jsonify({"status":"error","detail":str(e)}), 500
+        return jsonify({"error": "SERVER_ERROR", "detail": str(e)}), 500
 
-# ===========================
-# ENDPOINTS EXISTENTES
-# ===========================
-
-@app.get("/ventas")
-def ventas_list():
-    cliente = request.args.get("cliente")
-    referencia = request.args.get("referencia")
-    fecha_desde = request.args.get("fecha_desde")
-    fecha_hasta = request.args.get("fecha_hasta")
-    try:
-        limit = int(request.args.get("limit", 100))
-        offset = int(request.args.get("offset", 0))
-    except ValueError:
-        return jsonify({"error": "limit/offset inválidos"}), 400
-
-    where = []
-    params = []
-
-    if cliente:
-        where.append("LOWER(cliente) LIKE ?")
-        params.append(f"%{cliente.lower()}%")
-    if referencia:
-        where.append("LOWER(referencia) LIKE ?")
-        params.append(f"%{referencia.lower()}%")
-    if fecha_desde:
-        where.append("fecha >= ?")
-        params.append(fecha_desde)
-    if fecha_hasta:
-        where.append("fecha <= ?")
-        params.append(fecha_hasta)
-
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    sql = f"SELECT * FROM ventas {where_sql} LIMIT ? OFFSET ?;"
-    params += [limit, offset]
-
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        items = rows_to_dicts(cur, rows)
-
-        cur2 = conn.cursor()
-        cur2.execute(f"SELECT COUNT(*) FROM ventas {where_sql}", params[:-2])
-        total = cur2.fetchone()[0]
-
-    return jsonify({
-        "items": items,
-        "limit": limit,
-        "offset": offset,
-        "total": total
-    })
-
-@app.get("/ventas/<int:rowid>")
-def ventas_by_id(rowid: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT rowid AS id, * FROM ventas WHERE rowid = ?", (rowid,))
-        row = cur.fetchone()
-        if not row:
-            return jsonify({"error": "no encontrado"}), 404
-        return jsonify(rows_to_dicts(cur, [row])[0])
-
-# ===========================
-# RUN LOCAL
-# ===========================
+# ==============================
+# Entrypoint local
+# ==============================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
