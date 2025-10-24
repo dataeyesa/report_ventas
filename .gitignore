@@ -7,7 +7,4 @@
 __pycache__/
 *.pyc
 
-# Ignorar Excel y BD
-*.xlsx
-*.xlsm
-*.db
+
